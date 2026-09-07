@@ -1,0 +1,29 @@
+name: Keep Supabase awake
+
+# Supabase pauses free-tier projects after 7 days without an API request.
+# This pings the app's health endpoint (which touches the database) twice
+# a week so the closet is never asleep when you open it.
+#
+# Setup: add a repository variable APP_URL pointing at your deployment,
+# e.g. https://closetr.vercel.app
+#   Settings → Secrets and variables → Actions → Variables → New variable
+
+on:
+  schedule:
+    - cron: "0 12 * * 1,4" # Mondays and Thursdays, 12:00 UTC
+  workflow_dispatch: # lets you trigger it by hand to test
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: |
+          if [ -z "${{ vars.APP_URL }}" ]; then
+            echo "APP_URL variable is not set — skipping."
+            exit 0
+          fi
+          code=$(curl -sS -o /tmp/body -w "%{http_code}" "${{ vars.APP_URL }}/api/health")
+          echo "HTTP $code"
+          cat /tmp/body
+          test "$code" = "200"
