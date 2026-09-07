@@ -56,50 +56,81 @@ export async function createItem(
   const user = await getUser();
   if (!user) return FAILED("Not signed in.");
 
-  const name = item.name.trim();
-  if (!name) return FAILED("Name can't be empty.");
-  if (!(CATEGORIES as readonly string[]).includes(item.category)) {
-    return FAILED("Unknown category.");
-  }
-
-  // The client tells us where it put the files, so verify the paths are
-  // inside this user's prefix — otherwise an item could be made to point
-  // at somebody else's object.
-  for (const path of [item.originalImagePath, item.processedImagePath]) {
-    if (path !== null && !path.startsWith(`${user.id}/`)) {
-      return FAILED("Image path didn't belong to you.");
-    }
-  }
+  const reason = invalidReason(item, user.id);
+  if (reason) return FAILED(reason);
 
   const supabase = await createClient();
 
   const { data, error } = await supabase
     .from("items")
-    .insert({
-      user_id: user.id,
-      name,
-      brand: blankToNull(item.brand),
-      category: item.category,
-      subcategory: blankToNull(item.subcategory),
-      color: blankToNull(item.color),
-      color_hex: blankToNull(item.colorHex),
-      original_image_path: item.originalImagePath,
-      processed_image_path: item.processedImagePath,
-      source_url: blankToNull(item.sourceUrl),
-      source_title: blankToNull(item.sourceTitle),
-      favorite: false,
-      layout_overrides: null,
-    })
+    .insert(itemRow(item, user.id))
     .select("id")
     .single();
 
   if (error) return FAILED(error.message);
 
   const tagsResult = await replaceItemTags(data.id, item.tagNames, user.id);
-  if (!tagsResult.ok) return tagsResult;
+  if (!tagsResult.ok) {
+    // Same reasoning as the batch insert: the caller cleans up the images
+    // it uploaded, so a row that survived would be left pointing at none.
+    await supabase.from("items").delete().eq("id", data.id);
+    return tagsResult;
+  }
 
   refresh();
   return { ok: true, id: data.id };
+}
+
+/**
+ * Record a whole batch of items whose images the browser has uploaded.
+ *
+ * Same per-item rules as `createItem`; the batching is what makes a
+ * twenty-photo import bearable. The rows go in as one statement so a
+ * rejected import leaves no half-built closet behind, and the tag pass
+ * resolves every name across the batch at once — two queries instead of
+ * three per item.
+ */
+export async function createItems(
+  items: NewItem[],
+): Promise<{ ok: true; ids: string[] } | { ok: false; error: string }> {
+  const user = await getUser();
+  if (!user) return FAILED("Not signed in.");
+  if (items.length === 0) return { ok: true, ids: [] };
+
+  // Validate everything before writing anything — a batch that fails on
+  // item 19 shouldn't have already saved the first eighteen.
+  for (const [index, item] of items.entries()) {
+    const reason = invalidReason(item, user.id);
+    if (reason) return FAILED(`Item ${index + 1}: ${reason}`);
+  }
+
+  const supabase = await createClient();
+
+  const { data, error } = await supabase
+    .from("items")
+    .insert(items.map((item) => itemRow(item, user.id)))
+    .select("id");
+
+  if (error) return FAILED(error.message);
+
+  // A multi-row INSERT ... RETURNING comes back in insertion order, which
+  // is what lets the tag pass below line these ids up with the input.
+  const ids = (data ?? []).map((row) => row.id);
+  if (ids.length !== items.length) {
+    return FAILED("The database saved a different number of items than sent.");
+  }
+
+  const tagsResult = await tagNewItems(ids, items, user.id);
+  if (!tagsResult.ok) {
+    // Undo the insert. The caller deletes the uploaded images when we
+    // report a failure, so rows left behind here would point at objects
+    // that no longer exist.
+    await supabase.from("items").delete().in("id", ids);
+    return tagsResult;
+  }
+
+  refresh();
+  return { ok: true, ids };
 }
 
 export async function setFavorite(
@@ -204,22 +235,47 @@ function blankToNull(value: string | null): string | null {
   return trimmed ? trimmed : null;
 }
 
-/**
- * Point an item at exactly `names`, creating any tag the user hasn't
- * used before.
- *
- * Matching is case-insensitive to line up with the `lower(name)` unique
- * index — typing "fall" when "Fall" exists has to reuse the row, or the
- * insert trips the constraint.
- */
-async function replaceItemTags(
-  itemId: string,
-  names: string[],
-  userId: string,
-): Promise<ActionResult> {
-  const supabase = await createClient();
+/** Field checks shared by the single and batch inserts. Null means fine. */
+function invalidReason(item: NewItem, userId: string): string | null {
+  if (!item.name.trim()) return "Name can't be empty.";
+  if (!(CATEGORIES as readonly string[]).includes(item.category)) {
+    return "Unknown category.";
+  }
 
-  const wanted = [
+  // The client tells us where it put the files, so verify the paths are
+  // inside this user's prefix — otherwise an item could be made to point
+  // at somebody else's object.
+  for (const path of [item.originalImagePath, item.processedImagePath]) {
+    if (path !== null && !path.startsWith(`${userId}/`)) {
+      return "Image path didn't belong to you.";
+    }
+  }
+
+  return null;
+}
+
+/** The `items` row for a validated `NewItem`. */
+function itemRow(item: NewItem, userId: string) {
+  return {
+    user_id: userId,
+    name: item.name.trim(),
+    brand: blankToNull(item.brand),
+    category: item.category,
+    subcategory: blankToNull(item.subcategory),
+    color: blankToNull(item.color),
+    color_hex: blankToNull(item.colorHex),
+    original_image_path: item.originalImagePath,
+    processed_image_path: item.processedImagePath,
+    source_url: blankToNull(item.sourceUrl),
+    source_title: blankToNull(item.sourceTitle),
+    favorite: false,
+    layout_overrides: null,
+  };
+}
+
+/** Case-insensitive dedupe that keeps the first spelling seen. */
+function dedupe(names: string[]): string[] {
+  return [
     ...new Map(
       names
         .map((name) => name.trim())
@@ -227,6 +283,24 @@ async function replaceItemTags(
         .map((name) => [name.toLowerCase(), name]),
     ).values(),
   ];
+}
+
+/**
+ * Map tag names to ids, creating any the user hasn't used before.
+ *
+ * Matching is case-insensitive to line up with the `lower(name)` unique
+ * index — typing "fall" when "Fall" exists has to reuse the row, or the
+ * insert trips the constraint.
+ */
+async function resolveTagIds(
+  names: string[],
+  userId: string,
+): Promise<
+  | { ok: true; idByLowerName: Map<string, string> }
+  | { ok: false; error: string }
+> {
+  const supabase = await createClient();
+  const wanted = dedupe(names);
 
   const { data: existingRows, error: readError } = await supabase
     .from("tags")
@@ -238,7 +312,9 @@ async function replaceItemTags(
     (existingRows ?? []).map((row) => [row.name.toLowerCase(), row.id]),
   );
 
-  const missing = wanted.filter((name) => !idByLowerName.has(name.toLowerCase()));
+  const missing = wanted.filter(
+    (name) => !idByLowerName.has(name.toLowerCase()),
+  );
 
   if (missing.length > 0) {
     const { data: created, error: insertError } = await supabase
@@ -255,8 +331,22 @@ async function replaceItemTags(
     }
   }
 
-  const tagIds = wanted
-    .map((name) => idByLowerName.get(name.toLowerCase()))
+  return { ok: true, idByLowerName };
+}
+
+/** Point an item at exactly `names`, replacing whatever it had. */
+async function replaceItemTags(
+  itemId: string,
+  names: string[],
+  userId: string,
+): Promise<ActionResult> {
+  const resolved = await resolveTagIds(names, userId);
+  if (!resolved.ok) return resolved;
+
+  const supabase = await createClient();
+
+  const tagIds = dedupe(names)
+    .map((name) => resolved.idByLowerName.get(name.toLowerCase()))
     .filter((id): id is string => Boolean(id));
 
   const { error: clearError } = await supabase
@@ -273,6 +363,39 @@ async function replaceItemTags(
 
     if (linkError) return FAILED(linkError.message);
   }
+
+  return { ok: true };
+}
+
+/**
+ * Tag a freshly-inserted batch, `ids` positionally matching `items`.
+ *
+ * Unlike `replaceItemTags` there's nothing to clear — these rows are new —
+ * so the whole batch collapses into one tag lookup and one link insert.
+ */
+async function tagNewItems(
+  ids: string[],
+  items: NewItem[],
+  userId: string,
+): Promise<ActionResult> {
+  const resolved = await resolveTagIds(
+    items.flatMap((item) => item.tagNames),
+    userId,
+  );
+  if (!resolved.ok) return resolved;
+
+  const links = ids.flatMap((itemId, index) =>
+    dedupe(items[index].tagNames)
+      .map((name) => resolved.idByLowerName.get(name.toLowerCase()))
+      .filter((tagId): tagId is string => Boolean(tagId))
+      .map((tagId) => ({ item_id: itemId, tag_id: tagId })),
+  );
+
+  if (links.length === 0) return { ok: true };
+
+  const supabase = await createClient();
+  const { error } = await supabase.from("item_tags").insert(links);
+  if (error) return FAILED(error.message);
 
   return { ok: true };
 }

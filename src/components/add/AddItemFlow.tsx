@@ -12,18 +12,14 @@ import {
 } from "@/components/closet/ItemFields";
 import { createItem } from "@/app/closet/actions";
 import { createClient } from "@/lib/supabase/client";
-import { getBackgroundRemover } from "@/lib/images/background";
+import { ingestPhoto } from "@/lib/images/ingest";
+import { autofillFields } from "@/lib/add/autofill";
 import {
-  ORIGINAL_MAX_EDGE,
   VISION_MAX_EDGE,
-  alphaCropToSquare,
   blobToBase64,
   blobToBitmap,
-  decodeImage,
-  dominantColor,
   downscale,
 } from "@/lib/images/process";
-import { CATEGORIES, type Category } from "@/lib/categories";
 import type { SearchCandidate, Tag } from "@/lib/types";
 
 const AI_ENABLED = process.env.NEXT_PUBLIC_ENABLE_AI_METADATA === "true";
@@ -67,96 +63,32 @@ export function AddItemFlow({ allTags }: { allTags: Tag[] }) {
     setProgress(0);
 
     try {
-      setStatus("reading the photo...");
-      const bitmap = await decodeImage(file);
+      const photo = await ingestPhoto(file, {
+        onStatus: setStatus,
+        onProgress: setProgress,
+      });
 
-      setStatus("shrinking it...");
-      const originalBlob = await downscale(
-        bitmap,
-        ORIGINAL_MAX_EDGE,
-        "image/jpeg",
-      );
-      setOriginal(originalBlob);
+      setOriginal(photo.original);
+      setProcessed(photo.processed);
+      setPreview(URL.createObjectURL(photo.processed));
 
-      // Background removal is the one step allowed to fail. A visible
-      // photo with its background still on beats no item at all.
-      let processedBlob: Blob;
-      let swatch: string | null = null;
-
-      try {
-        setStatus("removing the background (first run downloads a model)...");
-        const cutout = await getBackgroundRemover().remove(
-          originalBlob,
-          setProgress,
-        );
-        const cutoutBitmap = await blobToBitmap(cutout);
-        processedBlob = await alphaCropToSquare(cutoutBitmap);
-        swatch = await dominantColor(cutoutBitmap);
-      } catch {
-        setNotice(
-          "couldn't cut out the background — saved the photo as it is.",
-        );
-        // Opaque input means the alpha crop finds no margin to trim, so
-        // this just squares the photo up.
-        processedBlob = await alphaCropToSquare(await blobToBitmap(originalBlob));
-      }
-
-      setProcessed(processedBlob);
-      setPreview(URL.createObjectURL(processedBlob));
+      const { swatch } = photo;
 
       if (AI_ENABLED) {
         setStatus("asking Claude what this is...");
-        await autofill(bitmap, swatch);
-      } else if (swatch) {
-        setValue((prev) => ({ ...prev, colorHex: swatch }));
+        const filled = await autofillFields(photo.visionBase64, swatch);
+        setValue(filled.value);
+        // The cut-out problem is the more useful one to surface.
+        setNotice(photo.notice ?? filled.notice);
+      } else {
+        if (swatch) setValue((prev) => ({ ...prev, colorHex: swatch }));
+        setNotice(photo.notice);
       }
 
       setStage("review");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Something broke.");
       setStage("pick");
-    }
-  }
-
-  /** Best effort — a failure here just means filling the form by hand. */
-  async function autofill(bitmap: ImageBitmap, swatch: string | null) {
-    try {
-      const visionBlob = await downscale(bitmap, VISION_MAX_EDGE, "image/jpeg");
-
-      const response = await fetch("/api/metadata", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          imageBase64: await blobToBase64(visionBlob),
-          mediaType: "image/jpeg",
-        }),
-      });
-
-      if (!response.ok) {
-        const { error: message } = await response.json().catch(() => ({}));
-        setNotice(message ?? "auto-fill didn't work — fill it in yourself.");
-        if (swatch) setValue((prev) => ({ ...prev, colorHex: swatch }));
-        return;
-      }
-
-      const filled = await response.json();
-
-      setValue({
-        name: filled.name ?? "",
-        brand: filled.brand ?? "",
-        category: (CATEGORIES as readonly string[]).includes(filled.category)
-          ? (filled.category as Category)
-          : "tops",
-        subcategory: filled.subcategory ?? "",
-        color: filled.color ?? "",
-        // Prefer the colour measured off the actual pixels; Claude's hex
-        // is a description of a colour, this one is the colour.
-        colorHex: swatch ?? filled.colorHex ?? "",
-        tagNames: Array.isArray(filled.tags) ? filled.tags : [],
-      });
-    } catch {
-      setNotice("auto-fill didn't work — fill it in yourself.");
-      if (swatch) setValue((prev) => ({ ...prev, colorHex: swatch }));
     }
   }
 
