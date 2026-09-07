@@ -31,6 +31,15 @@ type Stage = "pick" | "working" | "review";
 
 type Source = { url: string; title: string } | null;
 
+/** Bare domain, for showing where a match came from. */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
+
 export function AddItemFlow({ allTags }: { allTags: Tag[] }) {
   const router = useRouter();
 
@@ -50,6 +59,8 @@ export function AddItemFlow({ allTags }: { allTags: Tag[] }) {
   const [candidates, setCandidates] = useState<SearchCandidate[] | null>(null);
   const [searching, setSearching] = useState(false);
   const [saving, setSaving] = useState(false);
+  /** Non-null while a found photo is being swapped in; holds the status line. */
+  const [applying, setApplying] = useState<string | null>(null);
 
   const cameraRef = useRef<HTMLInputElement>(null);
   const uploadRef = useRef<HTMLInputElement>(null);
@@ -124,6 +135,55 @@ export function AddItemFlow({ allTags }: { allTags: Tag[] }) {
       setCandidates([]);
     } finally {
       setSearching(false);
+    }
+  }
+
+  /**
+   * Swap in the catalogue photo from a match.
+   *
+   * The fetched image goes through the same pipeline as a camera shot, so
+   * a swapped item is framed and cut out exactly like every other one.
+   * Their own photo stays as the archived original — this replaces what
+   * the closet displays, not what they actually own.
+   */
+  async function applyFoundPhoto(candidate: SearchCandidate) {
+    if (!candidate.imageUrl) return;
+
+    setApplying("fetching that photo...");
+    setError(null);
+
+    try {
+      const response = await fetch("/api/fetch-image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: candidate.imageUrl }),
+      });
+
+      if (!response.ok) {
+        const { error: message } = await response.json().catch(() => ({}));
+        throw new Error(message ?? "Couldn't use that photo.");
+      }
+
+      const blob = await response.blob();
+      const photo = await ingestPhoto(
+        new File([blob], "found-online", { type: blob.type }),
+        { onStatus: setApplying },
+      );
+
+      if (preview) URL.revokeObjectURL(preview);
+      setProcessed(photo.processed);
+      setPreview(URL.createObjectURL(photo.processed));
+      setSource({ url: candidate.url, title: candidate.title });
+      setNotice(
+        photo.notice ??
+          "using the photo from that page — your own is still saved as the original.",
+      );
+    } catch (caught) {
+      setError(
+        caught instanceof Error ? caught.message : "Couldn't use that photo.",
+      );
+    } finally {
+      setApplying(null);
     }
   }
 
@@ -245,26 +305,72 @@ export function AddItemFlow({ allTags }: { allTags: Tag[] }) {
                   <p className="microcopy mt-2">no matches found.</p>
                 )}
 
+                {applying && (
+                  <p className="microcopy mt-2 text-center">
+                    <span className="twinkle">★</span> {applying}
+                  </p>
+                )}
+
                 {candidates && candidates.length > 0 && (
                   <ul className="mt-2 divide-y divide-[var(--color-line-soft)]">
                     {candidates.map((candidate) => (
                       <li
                         key={candidate.url}
-                        className="flex items-center justify-between gap-2 py-1.5"
+                        className="flex items-center gap-2 py-2"
                       >
-                        <span className="truncate text-[12px]">
-                          {candidate.title}
-                        </span>
-                        <BevelButton
-                          onClick={() =>
-                            setSource({
-                              url: candidate.url,
-                              title: candidate.title,
-                            })
-                          }
-                        >
-                          Use
-                        </BevelButton>
+                        {candidate.imageUrl ? (
+                          // Shown straight from the source. It's only a
+                          // preview — nothing touches a canvas until the
+                          // user picks it, which is what needs the proxy.
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img
+                            src={candidate.imageUrl}
+                            alt=""
+                            loading="lazy"
+                            onError={(event) => {
+                              // Plenty of shops block hotlinking. A broken
+                              // icon is worse than no thumbnail.
+                              event.currentTarget.style.visibility = "hidden";
+                            }}
+                            className="h-12 w-12 shrink-0 border border-[var(--color-line-soft)] bg-[var(--color-paper)] object-contain"
+                          />
+                        ) : (
+                          <div className="h-12 w-12 shrink-0 border border-[var(--color-line-soft)] bg-[var(--color-paper-alt)]" />
+                        )}
+
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-[12px]">
+                            {candidate.title}
+                          </p>
+                          <p className="microcopy truncate">
+                            {hostOf(candidate.url)}
+                          </p>
+                        </div>
+
+                        <div className="flex shrink-0 flex-col gap-1">
+                          <BevelButton
+                            onClick={() =>
+                              setSource({
+                                url: candidate.url,
+                                title: candidate.title,
+                              })
+                            }
+                            disabled={Boolean(applying)}
+                            className="text-[10px]"
+                          >
+                            Link only
+                          </BevelButton>
+                          {candidate.imageUrl && (
+                            <BevelButton
+                              variant="primary"
+                              onClick={() => applyFoundPhoto(candidate)}
+                              disabled={Boolean(applying)}
+                              className="text-[10px]"
+                            >
+                              Link + photo
+                            </BevelButton>
+                          )}
+                        </div>
                       </li>
                     ))}
                   </ul>
