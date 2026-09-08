@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 import { getUser } from "@/lib/supabase/server";
-import type { SearchCandidate } from "@/lib/types";
+import {
+  extractResults,
+  type WebDetectionBlock,
+} from "@/lib/search/web-detection";
 
 /**
  * Google Vision Web Detection — "what is this thing, online?"
@@ -16,17 +19,9 @@ export const dynamic = "force-dynamic";
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 const ENDPOINT = "https://vision.googleapis.com/v1/images:annotate";
 
-type WebDetection = {
-  webDetection?: {
-    bestGuessLabels?: { label?: string }[];
-    pagesWithMatchingImages?: {
-      url?: string;
-      pageTitle?: string;
-      fullMatchingImages?: { url?: string }[];
-      partialMatchingImages?: { url?: string }[];
-    }[];
-    visuallySimilarImages?: { url?: string }[];
-  };
+/** The one response shape this route reads. Selection lives in the lib. */
+type VisionResponse = {
+  webDetection?: WebDetectionBlock;
   error?: { message?: string };
 };
 
@@ -69,7 +64,9 @@ export async function POST(request: Request) {
       requests: [
         {
           image: { content: imageBase64 },
-          features: [{ type: "WEB_DETECTION", maxResults: 10 }],
+          features: [{ type: "WEB_DETECTION", maxResults: 20 }],
+          // Landmark guessing only adds noise when the subject is a shirt.
+          imageContext: { webDetectionParams: { includeGeoResults: false } },
         },
       ],
     }),
@@ -84,29 +81,12 @@ export async function POST(request: Request) {
     );
   }
 
-  const payload: { responses?: WebDetection[] } = await response.json();
+  const payload: { responses?: VisionResponse[] } = await response.json();
   const result = payload.responses?.[0];
 
   if (result?.error?.message) {
     return NextResponse.json({ error: result.error.message }, { status: 502 });
   }
 
-  const detection = result?.webDetection;
-
-  const candidates: SearchCandidate[] = (detection?.pagesWithMatchingImages ?? [])
-    .map((page) => ({
-      title: (page.pageTitle ?? "").replace(/\s+/g, " ").trim(),
-      url: page.url ?? "",
-      imageUrl:
-        page.fullMatchingImages?.[0]?.url ??
-        page.partialMatchingImages?.[0]?.url ??
-        null,
-    }))
-    .filter((candidate) => candidate.url && candidate.title)
-    .slice(0, 8);
-
-  return NextResponse.json({
-    guess: detection?.bestGuessLabels?.[0]?.label ?? null,
-    candidates,
-  });
+  return NextResponse.json(extractResults(result?.webDetection));
 }

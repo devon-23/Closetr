@@ -14,12 +14,7 @@ import { createItem } from "@/app/closet/actions";
 import { createClient } from "@/lib/supabase/client";
 import { ingestPhoto } from "@/lib/images/ingest";
 import { autofillFields } from "@/lib/add/autofill";
-import {
-  VISION_MAX_EDGE,
-  blobToBase64,
-  blobToBitmap,
-  downscale,
-} from "@/lib/images/process";
+import { blobToBase64 } from "@/lib/images/process";
 import type { SearchCandidate, Tag } from "@/lib/types";
 
 const AI_ENABLED = process.env.NEXT_PUBLIC_ENABLE_AI_METADATA === "true";
@@ -30,6 +25,11 @@ const BUCKET = "closet";
 type Stage = "pick" | "working" | "review";
 
 type Source = { url: string; title: string } | null;
+
+/** Vision hands back lowercase labels; the name field wants a name. */
+function titleCase(text: string): string {
+  return text.replace(/\b\w/g, (character) => character.toUpperCase());
+}
 
 /** Bare domain, for showing where a match came from. */
 function hostOf(url: string): string {
@@ -57,6 +57,10 @@ export function AddItemFlow({ allTags }: { allTags: Tag[] }) {
   const [source, setSource] = useState<Source>(null);
 
   const [candidates, setCandidates] = useState<SearchCandidate[] | null>(null);
+  /** Product shots with no page attached — often all a hard item turns up. */
+  const [similarImages, setSimilarImages] = useState<string[]>([]);
+  /** Vision's own words for what this is, e.g. "philadelphia eagles hat". */
+  const [guess, setGuess] = useState<string | null>(null);
   const [searching, setSearching] = useState(false);
   const [saving, setSaving] = useState(false);
   /** Non-null while a found photo is being swapped in; holds the status line. */
@@ -112,43 +116,44 @@ export function AddItemFlow({ allTags }: { allTags: Tag[] }) {
       const response = await fetch("/api/visual-search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          imageBase64: await blobToBase64(
-            await downscale(
-              await blobToBitmap(original),
-              VISION_MAX_EDGE,
-              "image/jpeg",
-            ),
-          ),
-        }),
+        // The full 1600px original, not the 768px copy Claude gets. Web
+        // detection is matching against real photos rather than reading a
+        // garment, and it's priced per image, so there's nothing to save
+        // by sending it less to work with.
+        body: JSON.stringify({ imageBase64: await blobToBase64(original) }),
       });
 
       const payload = await response.json();
       if (!response.ok) {
         setError(payload.error ?? "Search failed.");
         setCandidates([]);
+        setSimilarImages([]);
         return;
       }
       setCandidates(payload.candidates ?? []);
+      setSimilarImages(payload.similarImages ?? []);
+      setGuess(payload.guess ?? null);
     } catch {
       setError("Couldn't reach the search service.");
       setCandidates([]);
+      setSimilarImages([]);
     } finally {
       setSearching(false);
     }
   }
 
   /**
-   * Swap in the catalogue photo from a match.
+   * Swap in a photo found online.
    *
    * The fetched image goes through the same pipeline as a camera shot, so
    * a swapped item is framed and cut out exactly like every other one.
    * Their own photo stays as the archived original — this replaces what
    * the closet displays, not what they actually own.
+   *
+   * `provenance` is null for a bare image, which is the common case for
+   * anything Vision recognised without finding a page to name.
    */
-  async function applyFoundPhoto(candidate: SearchCandidate) {
-    if (!candidate.imageUrl) return;
-
+  async function applyPhoto(imageUrl: string, provenance: Source) {
     setApplying("fetching that photo...");
     setError(null);
 
@@ -156,7 +161,7 @@ export function AddItemFlow({ allTags }: { allTags: Tag[] }) {
       const response = await fetch("/api/fetch-image", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: candidate.imageUrl }),
+        body: JSON.stringify({ url: imageUrl }),
       });
 
       if (!response.ok) {
@@ -173,10 +178,10 @@ export function AddItemFlow({ allTags }: { allTags: Tag[] }) {
       if (preview) URL.revokeObjectURL(preview);
       setProcessed(photo.processed);
       setPreview(URL.createObjectURL(photo.processed));
-      setSource({ url: candidate.url, title: candidate.title });
+      if (provenance) setSource(provenance);
       setNotice(
         photo.notice ??
-          "using the photo from that page — your own is still saved as the original.",
+          "using the photo found online — your own is still saved as the original.",
       );
     } catch (caught) {
       setError(
@@ -288,30 +293,65 @@ export function AddItemFlow({ allTags }: { allTags: Tag[] }) {
 
         {SEARCH_ENABLED && (
           <Panel title="Where's it from? (optional)">
-            {source ? (
-              <div className="flex items-center justify-between gap-2">
-                <p className="truncate text-[12px]">{source.title}</p>
-                <BevelButton onClick={() => setSource(null)}>
+            {source && (
+              <div className="mb-3 flex items-center justify-between gap-2 border border-[var(--color-line-soft)] bg-[var(--color-paper-alt)] p-2">
+                <div className="min-w-0">
+                  <p className="truncate text-[12px]">{source.title}</p>
+                  <p className="microcopy truncate">{hostOf(source.url)}</p>
+                </div>
+                <BevelButton
+                  onClick={() => setSource(null)}
+                  disabled={Boolean(applying)}
+                >
                   Clear
                 </BevelButton>
               </div>
-            ) : (
-              <>
-                <BevelButton onClick={findOnline} disabled={searching}>
-                  {searching ? "Looking..." : "🔎 Find this online"}
+            )}
+
+            <BevelButton
+              onClick={findOnline}
+              disabled={searching || Boolean(applying)}
+            >
+              {searching
+                ? "Looking..."
+                : candidates
+                  ? "🔎 Search again"
+                  : "🔎 Find this online"}
+            </BevelButton>
+
+            {guess && (
+              <div className="mt-2 flex items-center justify-between gap-2">
+                <p className="microcopy min-w-0 truncate">
+                  best guess:{" "}
+                  <span className="text-[var(--color-ink)]">{guess}</span>
+                </p>
+                <BevelButton
+                  onClick={() =>
+                    setValue((prev) => ({ ...prev, name: titleCase(guess) }))
+                  }
+                  disabled={Boolean(applying)}
+                  className="shrink-0 text-[10px]"
+                >
+                  Use as name
                 </BevelButton>
+              </div>
+            )}
 
-                {candidates?.length === 0 && (
-                  <p className="microcopy mt-2">no matches found.</p>
-                )}
+            {applying && (
+              <p className="microcopy mt-2 text-center">
+                <span className="twinkle">★</span> {applying}
+              </p>
+            )}
 
-                {applying && (
-                  <p className="microcopy mt-2 text-center">
-                    <span className="twinkle">★</span> {applying}
-                  </p>
-                )}
+            {candidates?.length === 0 && similarImages.length === 0 && (
+              <p className="microcopy mt-2">
+                nothing found. this searches Google Vision&apos;s web index,
+                which is a good deal smaller than Google Images — it misses
+                plenty, especially licensed merch.
+              </p>
+            )}
 
-                {candidates && candidates.length > 0 && (
+            {candidates && candidates.length > 0 && (
                   <ul className="mt-2 divide-y divide-[var(--color-line-soft)]">
                     {candidates.map((candidate) => (
                       <li
@@ -363,7 +403,12 @@ export function AddItemFlow({ allTags }: { allTags: Tag[] }) {
                           {candidate.imageUrl && (
                             <BevelButton
                               variant="primary"
-                              onClick={() => applyFoundPhoto(candidate)}
+                              onClick={() =>
+                                applyPhoto(candidate.imageUrl!, {
+                                  url: candidate.url,
+                                  title: candidate.title,
+                                })
+                              }
                               disabled={Boolean(applying)}
                               className="text-[10px]"
                             >
@@ -374,8 +419,39 @@ export function AddItemFlow({ allTags }: { allTags: Tag[] }) {
                       </li>
                     ))}
                   </ul>
-                )}
-              </>
+            )}
+
+            {similarImages.length > 0 && (
+              <div className="mt-3 border-t border-[var(--color-line-soft)] pt-2">
+                <p className="microcopy mb-1.5">
+                  just want a better picture? these look like your item but
+                  came without a page to link to — tap one to use it.
+                </p>
+                <ul className="grid grid-cols-4 gap-1.5 sm:grid-cols-6">
+                  {similarImages.map((url) => (
+                    <li key={url}>
+                      <button
+                        type="button"
+                        onClick={() => applyPhoto(url, null)}
+                        disabled={Boolean(applying)}
+                        title="Use this photo"
+                        className="bevel aspect-square w-full overflow-hidden bg-[var(--color-paper)] p-0.5 disabled:opacity-50"
+                      >
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={url}
+                          alt="A photo found online that may match this item"
+                          loading="lazy"
+                          onError={(event) => {
+                            event.currentTarget.style.visibility = "hidden";
+                          }}
+                          className="h-full w-full object-contain"
+                        />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
             )}
           </Panel>
         )}
