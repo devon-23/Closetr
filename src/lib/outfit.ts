@@ -6,7 +6,7 @@ import {
   type Category,
   type Slot,
 } from "./categories";
-import type { ClothingItem, OutfitDraft } from "./types";
+import type { ClothingItem, Outfit, OutfitDraft } from "./types";
 
 export const EMPTY_DRAFT: OutfitDraft = { selections: {} };
 
@@ -50,6 +50,27 @@ export function draftItems(
         item.category === "accessories" ? accessoryIndex++ : 0,
       ),
     }))
+    .sort((a, b) => a.slot.z - b.slot.z);
+}
+
+/**
+ * Pieces of a saved outfit, ready for the flat lay.
+ *
+ * Uses the slot stored alongside each piece rather than re-resolving it,
+ * which is the whole point of freezing it at save time. Items deleted
+ * from the closet since are dropped rather than rendered as holes.
+ */
+export function savedOutfitPieces(
+  outfit: Outfit,
+  items: ClothingItem[],
+): { item: ClothingItem; slot: Slot }[] {
+  const byId = new Map(items.map((item) => [item.id, item]));
+
+  return outfit.items
+    .map((piece) => ({ item: byId.get(piece.itemId), slot: piece.slot }))
+    .filter((piece): piece is { item: ClothingItem; slot: Slot } =>
+      Boolean(piece.item),
+    )
     .sort((a, b) => a.slot.z - b.slot.z);
 }
 

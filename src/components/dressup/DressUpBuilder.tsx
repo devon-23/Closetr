@@ -1,11 +1,13 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import { Panel } from "@/components/ui/Panel";
 import { BevelButton } from "@/components/ui/BevelButton";
 import { TabTray, type TabOption } from "@/components/ui/TabTray";
 import { ItemCarousel } from "@/components/dressup/ItemCarousel";
 import { OutfitPreview } from "@/components/dressup/OutfitPreview";
+import { createOutfit } from "@/app/outfits/actions";
 import { CATEGORIES, CATEGORY_LABELS, type Category } from "@/lib/categories";
 import {
   EMPTY_DRAFT,
@@ -20,14 +22,36 @@ type DressUpBuilderProps = {
   items: ClothingItem[];
 };
 
+/** "Black Tee + Blue Jeans" — the garments, not the accessories. */
+function suggestName(pieces: { item: ClothingItem }[]): string {
+  const named = pieces
+    .filter(({ item }) => item.category !== "accessories")
+    .map(({ item }) => item.name)
+    .slice(0, 2);
+
+  if (named.length > 0) return named.join(" + ");
+
+  return `Outfit ${new Date().toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+  })}`;
+}
+
 /**
  * Category tabs on top, one carousel at a time below, live flat-lay
  * preview above. No dragging, no canvas, no mannequin — a click picks
  * a piece and the preview redraws itself.
  */
 export function DressUpBuilder({ items }: DressUpBuilderProps) {
+  const router = useRouter();
+
   const [draft, setDraft] = useState(EMPTY_DRAFT);
   const [category, setCategory] = useState<Category>("tops");
+
+  /** Non-null once the user has committed to saving and is naming it. */
+  const [name, setName] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const pieces = useMemo(() => draftItems(draft, items), [draft, items]);
 
@@ -47,6 +71,30 @@ export function DressUpBuilder({ items }: DressUpBuilderProps) {
   );
 
   const count = draftSize(draft);
+
+  async function save() {
+    if (name === null) return;
+
+    setSaving(true);
+    setError(null);
+
+    const result = await createOutfit(
+      name,
+      pieces.map(({ item, slot }) => ({
+        itemId: item.id,
+        category: item.category,
+        slot,
+      })),
+    );
+
+    if (!result.ok) {
+      setError(result.error);
+      setSaving(false);
+      return;
+    }
+
+    router.push("/outfits");
+  }
 
   return (
     <div className="space-y-4">
@@ -83,19 +131,71 @@ export function DressUpBuilder({ items }: DressUpBuilderProps) {
             </ul>
           )}
 
-          <div className="mt-3 flex flex-wrap justify-center gap-2 border-t border-[var(--color-line-soft)] pt-3">
-            <BevelButton onClick={() => setDraft(randomOutfit(items))}>
-              🎲 Surprise me
-            </BevelButton>
-            <BevelButton
-              onClick={() => setDraft(EMPTY_DRAFT)}
-              disabled={count === 0}
-            >
-              ↻ Start over
-            </BevelButton>
-            <BevelButton variant="primary" disabled={count === 0}>
-              ★ Save ★
-            </BevelButton>
+          <div className="mt-3 border-t border-[var(--color-line-soft)] pt-3">
+            {name === null ? (
+              <div className="flex flex-wrap justify-center gap-2">
+                <BevelButton onClick={() => setDraft(randomOutfit(items))}>
+                  🎲 Surprise me
+                </BevelButton>
+                <BevelButton
+                  onClick={() => setDraft(EMPTY_DRAFT)}
+                  disabled={count === 0}
+                >
+                  ↻ Start over
+                </BevelButton>
+                <BevelButton
+                  variant="primary"
+                  disabled={count === 0}
+                  onClick={() => {
+                    setError(null);
+                    setName(suggestName(pieces));
+                  }}
+                >
+                  ★ Save ★
+                </BevelButton>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <label className="flex flex-col gap-0.5">
+                  <span className="label">Call it what?</span>
+                  <input
+                    value={name}
+                    onChange={(event) => setName(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        if (name.trim()) save();
+                      }
+                      if (event.key === "Escape") setName(null);
+                    }}
+                    autoFocus
+                    className="field"
+                  />
+                </label>
+
+                <div className="flex justify-between gap-2">
+                  <BevelButton onClick={() => setName(null)} disabled={saving}>
+                    Cancel
+                  </BevelButton>
+                  <BevelButton
+                    variant="primary"
+                    onClick={save}
+                    disabled={saving || !name.trim()}
+                  >
+                    {saving ? "Saving..." : "✨ Save it ✨"}
+                  </BevelButton>
+                </div>
+              </div>
+            )}
+
+            {error && (
+              <p
+                role="alert"
+                className="microcopy mt-2 text-center text-[var(--color-accent)]"
+              >
+                {error}
+              </p>
+            )}
           </div>
         </Panel>
 
