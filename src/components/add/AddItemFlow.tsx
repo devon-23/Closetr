@@ -26,6 +26,46 @@ type Stage = "pick" | "working" | "review";
 
 type Source = { url: string; title: string } | null;
 
+/** Tappable thumbnails of photos found online, from either search. */
+function PhotoGrid({
+  urls,
+  onPick,
+  disabled,
+}: {
+  urls: string[];
+  onPick: (url: string) => void;
+  disabled: boolean;
+}) {
+  return (
+    <ul className="grid grid-cols-4 gap-1.5 sm:grid-cols-6">
+      {urls.map((url) => (
+        <li key={url}>
+          <button
+            type="button"
+            onClick={() => onPick(url)}
+            disabled={disabled}
+            title="Use this photo"
+            className="bevel aspect-square w-full overflow-hidden bg-[var(--color-paper)] p-0.5 disabled:opacity-50"
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={url}
+              alt="A photo found online that may match this item"
+              loading="lazy"
+              onError={(event) => {
+                // Plenty of hosts block hotlinking. A broken icon is worse
+                // than a gap.
+                event.currentTarget.style.visibility = "hidden";
+              }}
+              className="h-full w-full object-contain"
+            />
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 /** Vision hands back lowercase labels; the name field wants a name. */
 function titleCase(text: string): string {
   return text.replace(/\b\w/g, (character) => character.toUpperCase());
@@ -62,6 +102,10 @@ export function AddItemFlow({ allTags }: { allTags: Tag[] }) {
   /** Vision's own words for what this is, e.g. "philadelphia eagles hat". */
   const [guess, setGuess] = useState<string | null>(null);
   const [searching, setSearching] = useState(false);
+  /** Null until edited, so the box tracks the item name until it doesn't. */
+  const [nameQuery, setNameQuery] = useState<string | null>(null);
+  const [nameImages, setNameImages] = useState<string[] | null>(null);
+  const [nameSearching, setNameSearching] = useState(false);
   const [saving, setSaving] = useState(false);
   /** Non-null while a found photo is being swapped in; holds the status line. */
   const [applying, setApplying] = useState<string | null>(null);
@@ -139,6 +183,39 @@ export function AddItemFlow({ allTags }: { allTags: Tag[] }) {
       setSimilarImages([]);
     } finally {
       setSearching(false);
+    }
+  }
+
+  /**
+   * Search by name rather than by photo.
+   *
+   * Reverse image search only finds an item whose exact photo is already
+   * on the web. This finds the item itself, which is what works for
+   * anything mass-produced but photographed badly.
+   */
+  async function findByName(query: string) {
+    setNameSearching(true);
+    setError(null);
+
+    try {
+      const response = await fetch("/api/product-search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        setError(payload.error ?? "Search failed.");
+        setNameImages([]);
+        return;
+      }
+      setNameImages(payload.images ?? []);
+    } catch {
+      setError("Couldn't reach the search service.");
+      setNameImages([]);
+    } finally {
+      setNameSearching(false);
     }
   }
 
@@ -427,32 +504,63 @@ export function AddItemFlow({ allTags }: { allTags: Tag[] }) {
                   just want a better picture? these look like your item but
                   came without a page to link to — tap one to use it.
                 </p>
-                <ul className="grid grid-cols-4 gap-1.5 sm:grid-cols-6">
-                  {similarImages.map((url) => (
-                    <li key={url}>
-                      <button
-                        type="button"
-                        onClick={() => applyPhoto(url, null)}
-                        disabled={Boolean(applying)}
-                        title="Use this photo"
-                        className="bevel aspect-square w-full overflow-hidden bg-[var(--color-paper)] p-0.5 disabled:opacity-50"
-                      >
-                        {/* eslint-disable-next-line @next/next/no-img-element */}
-                        <img
-                          src={url}
-                          alt="A photo found online that may match this item"
-                          loading="lazy"
-                          onError={(event) => {
-                            event.currentTarget.style.visibility = "hidden";
-                          }}
-                          className="h-full w-full object-contain"
-                        />
-                      </button>
-                    </li>
-                  ))}
-                </ul>
+                <PhotoGrid
+                  urls={similarImages}
+                  onPick={(url) => applyPhoto(url, null)}
+                  disabled={Boolean(applying)}
+                />
               </div>
             )}
+
+            <div className="mt-3 border-t border-[var(--color-line-soft)] pt-2">
+              <p className="microcopy mb-1.5">
+                or look it up by name — this finds the item rather than your
+                photo of it, which is what works for anything mass-produced.
+              </p>
+
+              <div className="flex gap-1">
+                <input
+                  value={nameQuery ?? value.name}
+                  onChange={(event) => setNameQuery(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter") return;
+                    event.preventDefault();
+                    const query = (nameQuery ?? value.name).trim();
+                    if (query) findByName(query);
+                  }}
+                  placeholder="philadelphia eagles fitted hat"
+                  aria-label="Search the web by name"
+                  className="field"
+                />
+                <BevelButton
+                  onClick={() => {
+                    const query = (nameQuery ?? value.name).trim();
+                    if (query) findByName(query);
+                  }}
+                  disabled={
+                    nameSearching ||
+                    Boolean(applying) ||
+                    !(nameQuery ?? value.name).trim()
+                  }
+                >
+                  {nameSearching ? "..." : "Go"}
+                </BevelButton>
+              </div>
+
+              {nameImages?.length === 0 && (
+                <p className="microcopy mt-1.5">nothing came back for that.</p>
+              )}
+
+              {nameImages && nameImages.length > 0 && (
+                <div className="mt-2">
+                  <PhotoGrid
+                    urls={nameImages}
+                    onPick={(url) => applyPhoto(url, null)}
+                    disabled={Boolean(applying)}
+                  />
+                </div>
+              )}
+            </div>
           </Panel>
         )}
 
